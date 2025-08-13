@@ -11,15 +11,45 @@
 #include <memory>
 #include <stdexcept>
 #include <iostream>
+#include <cstdint>
 
-// Helper function to convert hex string to float
-float hex_to_float(const std::string& hex_str) {
-    uint32_t int_val;
-    std::stringstream ss;
-    ss << std::hex << hex_str;
-    ss >> int_val;
-    return *reinterpret_cast<float*>(&int_val);
+// Data structure for binary communication
+// This must match the struct in the Spresense code
+struct IMUData {
+  uint32_t timestamp;
+  float temp;
+  float angular_velocity_x;
+  float angular_velocity_y;
+  float angular_velocity_z;
+  float linear_acceleration_x;
+  float linear_acceleration_y;
+  float linear_acceleration_z;
+  float raw_linear_acceleration_x;
+  float raw_linear_acceleration_y;
+  float raw_linear_acceleration_z;
+  float quat_w;
+  float quat_x;
+  float quat_y;
+  float quat_z;
+  float velocity_x;
+  float velocity_y;
+  float velocity_z;
+  float position_x;
+  float position_y;
+  float position_z;
+};
+
+const uint8_t HEADER[] = {0x5A, 0xA5};
+
+// Helper function to calculate checksum
+uint8_t calculate_checksum(const uint8_t* data, size_t len) {
+  uint8_t checksum = 0;
+  for (size_t i = 0; i < len; i++) {
+    checksum ^= data[i];
+  }
+  return checksum;
 }
+
 
 // Helper function to convert integer baud rate to LibSerial BaudRate enum
 LibSerial::BaudRate get_libserial_baudrate(int baudrate) {
@@ -53,7 +83,7 @@ public:
     LocalizerNode() : Node("cxd5602pwbimu_localizer_node") {
         // Declare and get parameters
         auto serial_port_param = this->declare_parameter<std::string>("serial_port", "/dev/ttyUSB0");
-        auto baud_rate_param = this->declare_parameter<int>("baud_rate", 115200);
+        auto baud_rate_param = this->declare_parameter<int>("baud_rate", 1152000);
         tf_parent_frame_ = this->declare_parameter<std::string>("tf_parent_frame", "world");
         tf_child_frame_ = this->declare_parameter<std::string>("tf_child_frame", "sensor");
 
@@ -61,7 +91,8 @@ public:
         RCLCPP_INFO(this->get_logger(), "TF frames: parent='%s', child='%s'", tf_parent_frame_.c_str(), tf_child_frame_.c_str());
 
         // Create publishers
-        imu_pub_ = this->create_publisher<sensor_msgs::msg::Imu>("imu/data_raw", 10);
+        imu_pub_ = this->create_publisher<sensor_msgs::msg::Imu>("imu/data", 10);
+        imu_raw_pub_ = this->create_publisher<sensor_msgs::msg::Imu>("imu/data_raw", 10);
         pose_pub_ = this->create_publisher<geometry_msgs::msg::Pose>("pose", 10);
 
         // Create TF broadcaster
@@ -69,6 +100,7 @@ public:
 
         try {
             serial_port_.Open(serial_port_param);
+            serial_port_.SetDTR(true);
             serial_port_.SetBaudRate(get_libserial_baudrate(baud_rate_param));
             serial_port_.SetCharacterSize(LibSerial::CharacterSize::CHAR_SIZE_8);
             serial_port_.SetFlowControl(LibSerial::FlowControl::FLOW_CONTROL_NONE);
@@ -84,11 +116,11 @@ public:
             return;
         }
 
-        RCLCPP_INFO(this->get_logger(), "Serial port opened successfully.");
+        RCLCPP_INFO(this->get_logger(), "Serial port opened successfully. Waiting for data...");
 
         // Create timer for reading data
         timer_ = this->create_wall_timer(
-            std::chrono::milliseconds(2),
+            std::chrono::milliseconds(1),
             std::bind(&LocalizerNode::read_serial_data, this));
     }
 
@@ -100,116 +132,146 @@ public:
     }
 
 private:
+    enum class ReadState {
+        WAITING_FOR_HEADER_1,
+        WAITING_FOR_HEADER_2,
+        READING_DATA
+    };
+
     void read_serial_data() {
         if (!serial_port_.IsOpen()) {
             return;
         }
 
-        std::string line;
+        std::vector<uint8_t> byte_buffer;
         try {
-            // Read until the newline character, with a timeout of 10ms
-            serial_port_.ReadLine(line, '\n', 10);
+            serial_port_.Read(byte_buffer, 256, 5);
         } catch (const LibSerial::ReadTimeout&) {
-            // This is expected if no data is available
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "No data from serial port (timeout). Is device connected and sending data?");
             return;
         } catch (const std::exception& e) {
             RCLCPP_WARN(this->get_logger(), "Error reading from serial port: %s", e.what());
             return;
         }
 
-        if (line.empty()) {
-            return;
-        }
-
-        std::stringstream ss(line);
-        std::string part;
-        std::vector<std::string> parts;
-        while(std::getline(ss, part, ',')) {
-            if (!part.empty()) {
-                parts.push_back(part);
+        if (!byte_buffer.empty()) {
+            RCLCPP_DEBUG(this->get_logger(), "Read %zu bytes from serial port.", byte_buffer.size());
+            for (uint8_t byte : byte_buffer) {
+                process_byte(byte);
             }
         }
+    }
 
-        if (parts.size() != 18) {
-            RCLCPP_WARN(this->get_logger(), "Unexpected data length: %zu, content: %s", parts.size(), line.c_str());
-            return;
+    void process_byte(uint8_t byte) {
+        switch (read_state_) {
+            case ReadState::WAITING_FOR_HEADER_1:
+                if (byte == HEADER[0]) {
+                    read_state_ = ReadState::WAITING_FOR_HEADER_2;
+                }
+                break;
+
+            case ReadState::WAITING_FOR_HEADER_2:
+                if (byte == HEADER[1]) {
+                    read_state_ = ReadState::READING_DATA;
+                    data_buffer_.clear();
+                } else {
+                    read_state_ = ReadState::WAITING_FOR_HEADER_1;
+                }
+                break;
+
+            case ReadState::READING_DATA:
+                data_buffer_.push_back(byte);
+                if (data_buffer_.size() == sizeof(IMUData) + 1) { // +1 for checksum
+                    IMUData received_data;
+                    uint8_t received_checksum = data_buffer_.back();
+                    data_buffer_.pop_back();
+                    
+                    std::copy(data_buffer_.begin(), data_buffer_.end(), reinterpret_cast<uint8_t*>(&received_data));
+
+                    uint8_t calculated_checksum = calculate_checksum(reinterpret_cast<const uint8_t*>(&received_data), sizeof(IMUData));
+
+                    if (calculated_checksum == received_checksum) {
+                        process_imu_data(received_data);
+                    } else {
+                        RCLCPP_WARN(this->get_logger(), "Checksum mismatch! Calculated: 0x%02X, Received: 0x%02X. Discarding packet.", calculated_checksum, received_checksum);
+                    }
+                    
+                    read_state_ = ReadState::WAITING_FOR_HEADER_1;
+                }
+                break;
         }
+    }
 
-        try {
-            // Angular velocity and linear acceleration
-            auto angular_velocity_x = hex_to_float(parts[2]);
-            auto angular_velocity_y = hex_to_float(parts[3]);
-            auto angular_velocity_z = hex_to_float(parts[4]);
-            auto linear_acceleration_x = hex_to_float(parts[5]);
-            auto linear_acceleration_y = hex_to_float(parts[6]);
-            auto linear_acceleration_z = hex_to_float(parts[7]);
+    void process_imu_data(const IMUData& data) {
+        auto now = this->get_clock()->now();
 
-            // Quaternion
-            auto quat_w = hex_to_float(parts[8]);
-            auto quat_x = hex_to_float(parts[9]);
-            auto quat_y = hex_to_float(parts[10]);
-            auto quat_z = hex_to_float(parts[11]);
+        // Create and publish IMU message
+        auto imu_msg = std::make_unique<sensor_msgs::msg::Imu>();
+        imu_msg->header.stamp = now;
+        imu_msg->header.frame_id = tf_child_frame_;
+        imu_msg->angular_velocity.x = data.angular_velocity_x;
+        imu_msg->angular_velocity.y = data.angular_velocity_y;
+        imu_msg->angular_velocity.z = data.angular_velocity_z;
+        imu_msg->linear_acceleration.x = data.linear_acceleration_x;
+        imu_msg->linear_acceleration.y = data.linear_acceleration_y;
+        imu_msg->linear_acceleration.z = data.linear_acceleration_z;
+        imu_msg->orientation.w = data.quat_w;
+        imu_msg->orientation.x = data.quat_x;
+        imu_msg->orientation.y = data.quat_y;
+        imu_msg->orientation.z = data.quat_z;
+        imu_msg->orientation_covariance[0] = -1;
+        imu_msg->angular_velocity_covariance[0] = -1;
+        imu_msg->linear_acceleration_covariance[0] = -1;
+        imu_pub_->publish(std::move(imu_msg));
 
-            // Position
-            auto pos_x = hex_to_float(parts[15]);
-            auto pos_y = hex_to_float(parts[16]);
-            auto pos_z = hex_to_float(parts[17]);
+        // Create and publish raw IMU message (uncompensated)
+        auto imu_raw_msg = std::make_unique<sensor_msgs::msg::Imu>();
+        imu_raw_msg->header.stamp = now;
+        imu_raw_msg->header.frame_id = tf_child_frame_;
+        imu_raw_msg->angular_velocity.x = data.angular_velocity_x;
+        imu_raw_msg->angular_velocity.y = data.angular_velocity_y;
+        imu_raw_msg->angular_velocity.z = data.angular_velocity_z;
+        imu_raw_msg->linear_acceleration.x = data.raw_linear_acceleration_x;
+        imu_raw_msg->linear_acceleration.y = data.raw_linear_acceleration_y;
+        imu_raw_msg->linear_acceleration.z = data.raw_linear_acceleration_z;
+        imu_raw_msg->orientation.w = data.quat_w;
+        imu_raw_msg->orientation.x = data.quat_x;
+        imu_raw_msg->orientation.y = data.quat_y;
+        imu_raw_msg->orientation.z = data.quat_z;
+        imu_raw_msg->orientation_covariance[0] = -1;
+        imu_raw_msg->angular_velocity_covariance[0] = -1;
+        imu_raw_msg->linear_acceleration_covariance[0] = -1;
+        imu_raw_pub_->publish(std::move(imu_raw_msg));
 
-            auto now = this->get_clock()->now();
+        // Create and publish Pose message
+        auto pose_msg = std::make_unique<geometry_msgs::msg::Pose>();
+        pose_msg->position.x = data.position_x;
+        pose_msg->position.y = data.position_y;
+        pose_msg->position.z = data.position_z;
+        pose_msg->orientation.w = data.quat_w;
+        pose_msg->orientation.x = data.quat_x;
+        pose_msg->orientation.y = data.quat_y;
+        pose_msg->orientation.z = data.quat_z;
+        pose_pub_->publish(std::move(pose_msg));
 
-            // Create and publish IMU message
-            auto imu_msg = std::make_unique<sensor_msgs::msg::Imu>();
-            imu_msg->header.stamp = now;
-            imu_msg->header.frame_id = "imu_link";
-            imu_msg->angular_velocity.x = angular_velocity_x;
-            imu_msg->angular_velocity.y = angular_velocity_y;
-            imu_msg->angular_velocity.z = angular_velocity_z;
-            imu_msg->linear_acceleration.x = linear_acceleration_x;
-            imu_msg->linear_acceleration.y = linear_acceleration_y;
-            imu_msg->linear_acceleration.z = linear_acceleration_z;
-            imu_msg->orientation.w = quat_w;
-            imu_msg->orientation.x = quat_x;
-            imu_msg->orientation.y = quat_y;
-            imu_msg->orientation.z = quat_z;
-            imu_msg->orientation_covariance[0] = -1;
-            imu_msg->angular_velocity_covariance[0] = -1;
-            imu_msg->linear_acceleration_covariance[0] = -1;
-            imu_pub_->publish(std::move(imu_msg));
-
-            // Create and publish Pose message
-            auto pose_msg = std::make_unique<geometry_msgs::msg::Pose>();
-            pose_msg->position.x = pos_x;
-            pose_msg->position.y = pos_y;
-            pose_msg->position.z = pos_z;
-            pose_msg->orientation.w = quat_w;
-            pose_msg->orientation.x = quat_x;
-            pose_msg->orientation.y = quat_y;
-            pose_msg->orientation.z = quat_z;
-            pose_pub_->publish(std::move(pose_msg));
-
-            // Create and broadcast Transform
-            geometry_msgs::msg::TransformStamped t;
-            t.header.stamp = now;
-            t.header.frame_id = tf_parent_frame_;
-            t.child_frame_id = tf_child_frame_;
-            t.transform.translation.x = pos_x;
-            t.transform.translation.y = pos_y;
-            t.transform.translation.z = pos_z;
-            t.transform.rotation.w = quat_w;
-            t.transform.rotation.x = quat_x;
-            t.transform.rotation.y = quat_y;
-            t.transform.rotation.z = quat_z;
-            tf_broadcaster_->sendTransform(t);
-
-        } catch (const std::invalid_argument& e) {
-            RCLCPP_ERROR(this->get_logger(), "Error parsing hex string: %s", e.what());
-        } catch (const std::out_of_range& e) {
-            RCLCPP_ERROR(this->get_logger(), "Error parsing hex string (out of range): %s", e.what());
-        }
+        // Create and broadcast Transform
+        geometry_msgs::msg::TransformStamped t;
+        t.header.stamp = now;
+        t.header.frame_id = tf_parent_frame_;
+        t.child_frame_id = tf_child_frame_;
+        t.transform.translation.x = data.position_x;
+        t.transform.translation.y = data.position_y;
+        t.transform.translation.z = data.position_z;
+        t.transform.rotation.w = data.quat_w;
+        t.transform.rotation.x = data.quat_x;
+        t.transform.rotation.y = data.quat_y;
+        t.transform.rotation.z = data.quat_z;
+        tf_broadcaster_->sendTransform(t);
     }
 
     rclcpp::TimerBase::SharedPtr timer_;
     rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_raw_pub_;
     rclcpp::Publisher<geometry_msgs::msg::Pose>::SharedPtr pose_pub_;
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
     
@@ -217,6 +279,8 @@ private:
     std::string tf_child_frame_;
 
     LibSerial::SerialPort serial_port_;
+    ReadState read_state_ = ReadState::WAITING_FOR_HEADER_1;
+    std::vector<uint8_t> data_buffer_;
 };
 
 int main(int argc, char * argv[]) {
