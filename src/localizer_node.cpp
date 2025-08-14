@@ -6,6 +6,7 @@
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <libserial/SerialPort.h>
+#include <std_srvs/srv/trigger.hpp>
 
 #include <string>
 #include <vector>
@@ -121,6 +122,11 @@ public:
         timer_ = this->create_wall_timer(
             std::chrono::milliseconds(1),
             std::bind(&LocalizerNode::read_serial_data, this));
+
+        // Create Reset Service
+        reset_service_ = this->create_service<std_srvs::srv::Trigger>(
+            "/cxd5602pwbimu_localizer_node/reset_pose",
+            std::bind(&LocalizerNode::handle_reset_service, this, std::placeholders::_1, std::placeholders::_2));
     }
 
     ~LocalizerNode() {
@@ -131,6 +137,23 @@ public:
     }
 
 private:
+    void handle_reset_service(
+        const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+        std::shared_ptr<std_srvs::srv::Trigger::Response> response)
+    {
+        (void)request; // Unused
+        RCLCPP_INFO(this->get_logger(), "Reset service called. Sending reset command to device.");
+        try {
+            serial_port_.Write("REST");
+            response->success = true;
+            response->message = "Reset command sent successfully.";
+        } catch (const std::exception& e) {
+            RCLCPP_ERROR(this->get_logger(), "Failed to send reset command: %s", e.what());
+            response->success = false;
+            response->message = "Failed to send reset command.";
+        }
+    }
+
     void read_serial_data() {
         if (!serial_port_.IsOpen()) {
             return;
@@ -288,6 +311,7 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_raw_pub_;
     rclcpp::Publisher<geometry_msgs::msg::Pose>::SharedPtr pose_pub_;
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reset_service_;
     
     std::string tf_parent_frame_;
     std::string tf_child_frame_;

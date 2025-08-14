@@ -10,6 +10,7 @@ find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
+find_package(std_srvs REQUIRED)
 
 add_executable(localizer_node src/localizer_node.cpp)
 ament_target_dependencies(localizer_node
@@ -17,6 +18,7 @@ ament_target_dependencies(localizer_node
   sensor_msgs
   geometry_msgs
   tf2_ros
+  std_srvs
 )
 
 target_link_libraries(localizer_node serial)
