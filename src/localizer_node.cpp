@@ -1,3 +1,5 @@
+#include <iomanip> // for std::hex, std::setw, std::setfill
+#include <sstream> // for std::stringstream
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <geometry_msgs/msg/pose.hpp>
@@ -15,7 +17,7 @@
 
 // Data structure for binary communication
 // This must match the struct in the Spresense code
-struct IMUData {
+struct __attribute__((packed)) IMUData {
   uint32_t timestamp;
   float temp;
   float angular_velocity_x;
@@ -39,7 +41,7 @@ struct IMUData {
   float position_z;
 };
 
-const uint8_t HEADER[] = {0x5A, 0xA5};
+const uint8_t HEADER[] = {0xAA, 0xBB, 0xCC, 0xDD};
 
 // Helper function to calculate checksum
 uint8_t calculate_checksum(const uint8_t* data, size_t len) {
@@ -89,6 +91,7 @@ public:
 
         RCLCPP_INFO(this->get_logger(), "Using serial port: %s at %ld baud", serial_port_param.c_str(), baud_rate_param);
         RCLCPP_INFO(this->get_logger(), "TF frames: parent='%s', child='%s'", tf_parent_frame_.c_str(), tf_child_frame_.c_str());
+        RCLCPP_INFO(this->get_logger(), "sizeof(IMUData): %zu", sizeof(IMUData));
 
         // Create publishers
         imu_pub_ = this->create_publisher<sensor_msgs::msg::Imu>("imu/data", 10);
@@ -110,10 +113,6 @@ public:
             RCLCPP_ERROR(this->get_logger(), "Failed to open serial port: %s", e.what());
             rclcpp::shutdown();
             return;
-        } catch (const std::invalid_argument& e) {
-            RCLCPP_ERROR(this->get_logger(), "Invalid baud rate specified: %ld", baud_rate_param);
-            rclcpp::shutdown();
-            return;
         }
 
         RCLCPP_INFO(this->get_logger(), "Serial port opened successfully. Waiting for data...");
@@ -132,12 +131,6 @@ public:
     }
 
 private:
-    enum class ReadState {
-        WAITING_FOR_HEADER_1,
-        WAITING_FOR_HEADER_2,
-        READING_DATA
-    };
-
     void read_serial_data() {
         if (!serial_port_.IsOpen()) {
             return;
@@ -145,60 +138,81 @@ private:
 
         std::vector<uint8_t> byte_buffer;
         try {
-            serial_port_.Read(byte_buffer, 256, 5);
+            serial_port_.Read(byte_buffer, 256, 30); // Read a larger chunk
         } catch (const LibSerial::ReadTimeout&) {
             RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "No data from serial port (timeout). Is device connected and sending data?");
-            return;
-        } catch (const std::exception& e) {
-            RCLCPP_WARN(this->get_logger(), "Error reading from serial port: %s", e.what());
             return;
         }
 
         if (!byte_buffer.empty()) {
             RCLCPP_DEBUG(this->get_logger(), "Read %zu bytes from serial port.", byte_buffer.size());
-            for (uint8_t byte : byte_buffer) {
-                process_byte(byte);
-            }
+            process_serial_buffer(byte_buffer);
         }
     }
 
-    void process_byte(uint8_t byte) {
-        switch (read_state_) {
-            case ReadState::WAITING_FOR_HEADER_1:
-                if (byte == HEADER[0]) {
-                    read_state_ = ReadState::WAITING_FOR_HEADER_2;
+    void process_serial_buffer(const std::vector<uint8_t>& new_bytes) {
+        data_buffer_.insert(data_buffer_.end(), new_bytes.begin(), new_bytes.end());
+
+        size_t current_offset = 0;
+        while (true) {
+            // Search for header
+            size_t header_start_pos = std::string::npos;
+            for (size_t i = current_offset; i <= data_buffer_.size() - sizeof(HEADER); ++i) {
+                if (std::memcmp(data_buffer_.data() + i, HEADER, sizeof(HEADER)) == 0) {
+                    header_start_pos = i;
+                    break;
                 }
-                break;
+            }
 
-            case ReadState::WAITING_FOR_HEADER_2:
-                if (byte == HEADER[1]) {
-                    read_state_ = ReadState::READING_DATA;
-                    data_buffer_.clear();
-                } else {
-                    read_state_ = ReadState::WAITING_FOR_HEADER_1;
+            if (header_start_pos == std::string::npos) {
+                size_t keep = std::min<size_t>(data_buffer_.size(), sizeof(HEADER)-1);
+                if (data_buffer_.size() > keep) {
+                    data_buffer_.erase(data_buffer_.begin(), data_buffer_.end() - keep);
                 }
+                break; // Exit loop, wait for more data
+            }
+
+            // Discard any bytes before the found header
+            if (header_start_pos > current_offset) {
+                data_buffer_.erase(data_buffer_.begin(), data_buffer_.begin() + header_start_pos);
+                current_offset = 0; // Reset offset after erase
+            }
+
+            // Now, header_start_pos is effectively 0 relative to the current data_buffer_
+            // Check if a full packet (header + IMUData + checksum) is available
+            if (data_buffer_.size() < sizeof(HEADER) + sizeof(IMUData) + 1) {
+                // Not enough bytes for a full packet, break and wait for more data
                 break;
+            }
 
-            case ReadState::READING_DATA:
-                data_buffer_.push_back(byte);
-                if (data_buffer_.size() == sizeof(IMUData) + 1) { // +1 for checksum
-                    IMUData received_data;
-                    uint8_t received_checksum = data_buffer_.back();
-                    data_buffer_.pop_back();
-                    
-                    std::copy(data_buffer_.begin(), data_buffer_.end(), reinterpret_cast<uint8_t*>(&received_data));
+            // Extract packet
+            std::vector<uint8_t> packet_data(data_buffer_.begin() + sizeof(HEADER), data_buffer_.begin() + sizeof(HEADER) + sizeof(IMUData) + 1);
+            
+            IMUData received_data;
+            uint8_t received_checksum = packet_data.back();
+            packet_data.pop_back(); // Remove checksum from packet_data
 
-                    uint8_t calculated_checksum = calculate_checksum(reinterpret_cast<const uint8_t*>(&received_data), sizeof(IMUData));
+            std::copy(packet_data.begin(), packet_data.end(), reinterpret_cast<uint8_t*>(&received_data));
 
-                    if (calculated_checksum == received_checksum) {
-                        process_imu_data(received_data);
-                    } else {
-                        RCLCPP_WARN(this->get_logger(), "Checksum mismatch! Calculated: 0x%02X, Received: 0x%02X. Discarding packet.", calculated_checksum, received_checksum);
-                    }
-                    
-                    read_state_ = ReadState::WAITING_FOR_HEADER_1;
+            uint8_t calculated_checksum = calculate_checksum(reinterpret_cast<const uint8_t*>(&received_data), sizeof(IMUData));
+
+            if (calculated_checksum == received_checksum) {
+                process_imu_data(received_data);
+            } else {
+                RCLCPP_WARN(this->get_logger(), "Checksum mismatch! Calculated: 0x%02X, Received: 0x%02X. Discarding packet.", calculated_checksum, received_checksum);
+                // Add debug print for raw data
+                std::stringstream ss;
+                ss << "Received raw data (hex): ";
+                for (size_t i = 0; i < packet_data.size(); ++i) {
+                    ss << std::hex << std::setw(2) << std::setfill('0') << (int)packet_data[i] << " ";
                 }
-                break;
+                ss << "Received checksum byte: " << std::hex << std::setw(2) << std::setfill('0') << (int)received_checksum;
+                RCLCPP_WARN(this->get_logger(), "%s", ss.str().c_str());
+            }
+            
+            // Remove the processed packet from the buffer
+            data_buffer_.erase(data_buffer_.begin(), data_buffer_.begin() + sizeof(HEADER) + sizeof(IMUData) + 1);
+            current_offset = 0; // Reset offset after erase
         }
     }
 
@@ -279,7 +293,7 @@ private:
     std::string tf_child_frame_;
 
     LibSerial::SerialPort serial_port_;
-    ReadState read_state_ = ReadState::WAITING_FOR_HEADER_1;
+    
     std::vector<uint8_t> data_buffer_;
 };
 
