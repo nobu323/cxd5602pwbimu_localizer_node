@@ -85,10 +85,10 @@ class LocalizerNode : public rclcpp::Node {
 public:
     LocalizerNode() : Node("cxd5602pwbimu_localizer_node") {
         // Declare and get parameters
-        auto serial_port_param = this->declare_parameter<std::string>("serial_port", "/dev/ttyUSB0");
+        auto serial_port_param = this->declare_parameter<std::string>("serial_port", "/dev/ttyMULIMU");
         auto baud_rate_param = this->declare_parameter<int>("baud_rate", 1152000);
         tf_parent_frame_ = this->declare_parameter<std::string>("tf_parent_frame", "world");
-        tf_child_frame_ = this->declare_parameter<std::string>("tf_child_frame", "sensor");
+        tf_child_frame_ = this->declare_parameter<std::string>("tf_child_frame", "imu_sensor");
 
         RCLCPP_INFO(this->get_logger(), "Using serial port: %s at %ld baud", serial_port_param.c_str(), baud_rate_param);
         RCLCPP_INFO(this->get_logger(), "TF frames: parent='%s', child='%s'", tf_parent_frame_.c_str(), tf_child_frame_.c_str());
@@ -161,7 +161,7 @@ private:
 
         std::vector<uint8_t> byte_buffer;
         try {
-            serial_port_.Read(byte_buffer, 256, 30); // Read a larger chunk
+            serial_port_.Read(byte_buffer, 256, 100); // Read a larger chunk
         } catch (const LibSerial::ReadTimeout&) {
             RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "No data from serial port (timeout). Is device connected and sending data?");
             return;
@@ -245,7 +245,7 @@ private:
         // Create and publish IMU message
         auto imu_msg = std::make_unique<sensor_msgs::msg::Imu>();
         imu_msg->header.stamp = now;
-        imu_msg->header.frame_id = tf_child_frame_;
+        imu_msg->header.frame_id = "imu_link";
         imu_msg->angular_velocity.x = data.angular_velocity_x;
         imu_msg->angular_velocity.y = data.angular_velocity_y;
         imu_msg->angular_velocity.z = data.angular_velocity_z;
@@ -264,7 +264,7 @@ private:
         // Create and publish raw IMU message (uncompensated)
         auto imu_raw_msg = std::make_unique<sensor_msgs::msg::Imu>();
         imu_raw_msg->header.stamp = now;
-        imu_raw_msg->header.frame_id = tf_child_frame_;
+        imu_raw_msg->header.frame_id = "imu_link";
         imu_raw_msg->angular_velocity.x = data.angular_velocity_x;
         imu_raw_msg->angular_velocity.y = data.angular_velocity_y;
         imu_raw_msg->angular_velocity.z = data.angular_velocity_z;
